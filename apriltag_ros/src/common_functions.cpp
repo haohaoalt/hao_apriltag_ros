@@ -47,7 +47,7 @@ namespace apriltag_ros
 
 TagDetector::TagDetector(ros::NodeHandle pnh) :
     family_(getAprilTagOption<std::string>(pnh, "tag_family", "tag36h11")),
-    threads_(getAprilTagOption<int>(pnh, "tag_threads", 4)),
+    threads_(getAprilTagOption<int>(pnh, "tag_threads", 0)),
     decimate_(getAprilTagOption<double>(pnh, "tag_decimate", 1.0)),
     blur_(getAprilTagOption<double>(pnh, "tag_blur", 0.0)),
     refine_edges_(getAprilTagOption<int>(pnh, "tag_refine_edges", 1)),
@@ -145,6 +145,12 @@ TagDetector::TagDetector(ros::NodeHandle pnh) :
     exit(1);
   }
 
+  if (threads_ == 0)
+  {
+    threads_ = std::max(std::thread::hardware_concurrency() - 1U, 1U);
+    ROS_INFO("Thread count not specified. Using %d threads", threads_);
+  }
+
   // Create the AprilTag 2 detector
   td_ = apriltag_detector_create();
   apriltag_detector_add_family_bits(td_, tf_, max_hamming_distance_);
@@ -231,6 +237,12 @@ AprilTagDetectionArray TagDetector::detectTags (
   double cx = camera_model.cx(); // optical center x-coordinate [px]
   double cy = camera_model.cy(); // optical center y-coordinate [px]
 
+  ROS_INFO_STREAM_ONCE("Camera model: fx = " << fx << ", fy = " << fy << ", cx = " << cx << ", cy = " << cy);
+
+  // Check if camera intrinsics are not available - if not the calculated
+  // transforms are meaningless.
+  if (fx == 0 && fy == 0) ROS_WARN_STREAM_THROTTLE(5, "fx and fy are zero. Are the camera intrinsics set?");
+
   // Run AprilTag 2 algorithm on the image
   if (detections_)
   {
@@ -239,7 +251,7 @@ AprilTagDetectionArray TagDetector::detectTags (
   }
   detections_ = apriltag_detector_detect(td_, &apriltag_image);
 
-  // If remove_dulpicates_ is set to true, then duplicate tags are not allowed.
+  // If remove_duplicates_ is set to true, then duplicate tags are not allowed.
   // Thus any duplicate tag IDs visible in the scene must include at least 1
   // erroneous detection. Remove any tags with duplicate IDs to ensure removal
   // of these erroneous detections
@@ -329,14 +341,11 @@ AprilTagDetectionArray TagDetector::detectTags (
     std::vector<cv::Point2d > standaloneTagImagePoints;
     addObjectPoints(tag_size/2, cv::Matx44d::eye(), standaloneTagObjectPoints);
     addImagePoints(detection, standaloneTagImagePoints);
-    Eigen::Matrix4d transform = getRelativeTransform(standaloneTagObjectPoints,
+    Eigen::Isometry3d transform = getRelativeTransform(standaloneTagObjectPoints,
                                                      standaloneTagImagePoints,
                                                      fx, fy, cx, cy);
-    Eigen::Matrix3d rot = transform.block(0, 0, 3, 3);
-    Eigen::Quaternion<double> rot_quaternion(rot);
-
     geometry_msgs::PoseWithCovarianceStamped tag_pose =
-        makeTagPose(transform, rot_quaternion, image->header);
+        makeTagPose(transform, image->header);
 
     // Add the detection to the back of the tag detection array
     AprilTagDetection tag_detection;
@@ -365,14 +374,11 @@ AprilTagDetectionArray TagDetector::detectTags (
       // position!
       TagBundleDescription& bundle = tag_bundle_descriptions_[j];
 
-      Eigen::Matrix4d transform =
+      Eigen::Isometry3d transform =
           getRelativeTransform(bundleObjectPoints[bundleName],
                                bundleImagePoints[bundleName], fx, fy, cx, cy);
-      Eigen::Matrix3d rot = transform.block(0, 0, 3, 3);
-      Eigen::Quaternion<double> rot_quaternion(rot);
-
       geometry_msgs::PoseWithCovarianceStamped bundle_pose =
-          makeTagPose(transform, rot_quaternion, image->header);
+          makeTagPose(transform, image->header);
 
       // Add the detection to the back of the tag detection array
       AprilTagDetection tag_detection;
@@ -404,8 +410,8 @@ AprilTagDetectionArray TagDetector::detectTags (
 
 int TagDetector::idComparison (const void* first, const void* second)
 {
-  int id1 = ((apriltag_detection_t*) first)->id;
-  int id2 = ((apriltag_detection_t*) second)->id;
+  int id1 = (*(apriltag_detection_t**)first)->id;
+  int id2 = (*(apriltag_detection_t**)second)->id;
   return (id1 < id2) ? -1 : ((id1 == id2) ? 0 : 1);
 }
 
@@ -421,22 +427,23 @@ void TagDetector::removeDuplicates ()
       // The entire detection set was parsed
       return;
     }
-    apriltag_detection_t *detection;
-    zarray_get(detections_, count, &detection);
-    int id_current = detection->id;
+    apriltag_detection_t *next_detection, *current_detection;
+    zarray_get(detections_, count, &current_detection);
+    int id_current = current_detection->id;
     // Default id_next value of -1 ensures that if the last detection
     // is a duplicated tag ID, it will get removed
     int id_next = -1;
     if (count < zarray_size(detections_)-1)
     {
-      zarray_get(detections_, count+1, &detection);
-      id_next = detection->id;
+      zarray_get(detections_, count+1, &next_detection);
+      id_next = next_detection->id;
     }
     if (id_current == id_next || (id_current != id_next && duplicate_detected))
     {
       duplicate_detected = true;
       // Remove the current tag detection from detections array
       int shuffle = 0;
+      apriltag_detection_destroy(current_detection);
       zarray_remove_index(detections_, count, shuffle);
       if (id_current != id_next)
       {
@@ -484,11 +491,13 @@ void TagDetector::addImagePoints (
   }
 }
 
-Eigen::Matrix4d TagDetector::getRelativeTransform(
-    std::vector<cv::Point3d > objectPoints,
-    std::vector<cv::Point2d > imagePoints,
+Eigen::Isometry3d TagDetector::getRelativeTransform(
+    const std::vector<cv::Point3d >& objectPoints,
+    const std::vector<cv::Point2d >& imagePoints,
     double fx, double fy, double cx, double cy) const
 {
+  Eigen::Isometry3d T = Eigen::Isometry3d::Identity();  // homogeneous transformation matrix
+
   // perform Perspective-n-Point camera pose estimation using the
   // above 3D-2D point correspondences
   cv::Mat rvec, tvec;
@@ -502,28 +511,27 @@ Eigen::Matrix4d TagDetector::getRelativeTransform(
   cv::solvePnP(objectPoints, imagePoints, cameraMatrix, distCoeffs, rvec, tvec);
   cv::Matx33d R;
   cv::Rodrigues(rvec, R);
-  Eigen::Matrix3d wRo;
-  wRo << R(0,0), R(0,1), R(0,2), R(1,0), R(1,1), R(1,2), R(2,0), R(2,1), R(2,2);
 
-  Eigen::Matrix4d T; // homogeneous transformation matrix
-  T.topLeftCorner(3, 3) = wRo;
-  T.col(3).head(3) <<
-      tvec.at<double>(0), tvec.at<double>(1), tvec.at<double>(2);
-  T.row(3) << 0,0,0,1;
+  // rotation
+  T.linear() << R(0,0), R(0,1), R(0,2), R(1,0), R(1,1), R(1,2), R(2,0), R(2,1), R(2,2);
+
+  // translation
+  T.translation() = Eigen::Vector3d::Map(reinterpret_cast<const double*>(tvec.data));
+
   return T;
 }
 
 geometry_msgs::PoseWithCovarianceStamped TagDetector::makeTagPose(
-    const Eigen::Matrix4d& transform,
-    const Eigen::Quaternion<double> rot_quaternion,
+    const Eigen::Isometry3d& transform,
     const std_msgs::Header& header)
 {
   geometry_msgs::PoseWithCovarianceStamped pose;
   pose.header = header;
+  Eigen::Quaterniond rot_quaternion(transform.linear());
   //===== Position and orientation
-  pose.pose.pose.position.x    = transform(0, 3);
-  pose.pose.pose.position.y    = transform(1, 3);
-  pose.pose.pose.position.z    = transform(2, 3);
+  pose.pose.pose.position.x    = transform.translation().x();
+  pose.pose.pose.position.y    = transform.translation().y();
+  pose.pose.pose.position.z    = transform.translation().z();
   pose.pose.pose.orientation.x = rot_quaternion.x();
   pose.pose.pose.orientation.y = rot_quaternion.y();
   pose.pose.pose.orientation.z = rot_quaternion.z();

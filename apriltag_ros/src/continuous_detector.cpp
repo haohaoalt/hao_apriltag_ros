@@ -51,8 +51,10 @@ void ContinuousDetector::onInit ()
   std::string transport_hint;
   pnh.param<std::string>("transport_hint", transport_hint, "raw");
 
+  int queue_size;
+  pnh.param<int>("queue_size", queue_size, 1);
   camera_image_subscriber_ =
-      it_->subscribeCamera("image_rect", 1,
+      it_->subscribeCamera("image_rect", queue_size,
                           &ContinuousDetector::imageCallback, this,
                           image_transport::TransportHints(transport_hint));
   tag_detections_publisher_ =
@@ -61,12 +63,34 @@ void ContinuousDetector::onInit ()
   {
     tag_detections_image_publisher_ = it_->advertise("tag_detections_image", 1);
   }
+
+  refresh_params_service_ =
+      pnh.advertiseService("refresh_tag_params", 
+                          &ContinuousDetector::refreshParamsCallback, this);
+}
+
+void ContinuousDetector::refreshTagParameters()
+{
+  // Resetting the tag detector will cause a new param server lookup
+  // So if the parameters have changed (by someone/something), 
+  // they will be updated dynamically
+  std::scoped_lock<std::mutex> lock(detection_mutex_);
+  ros::NodeHandle& pnh = getPrivateNodeHandle();
+  tag_detector_.reset(new TagDetector(pnh));
+}
+
+bool ContinuousDetector::refreshParamsCallback(std_srvs::Empty::Request& req,
+                                               std_srvs::Empty::Response& res)
+{
+  refreshTagParameters();
+  return true;
 }
 
 void ContinuousDetector::imageCallback (
     const sensor_msgs::ImageConstPtr& image_rect,
     const sensor_msgs::CameraInfoConstPtr& camera_info)
 {
+  std::scoped_lock<std::mutex> lock(detection_mutex_);
   // Lazy updates:
   // When there are no subscribers _and_ when tf is not published,
   // skip detection.
